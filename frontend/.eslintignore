@@ -1,0 +1,4 @@
+# .eslintignore
+*.js
+*.tsx
+*.ts
