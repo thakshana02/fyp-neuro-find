@@ -99,7 +99,7 @@ export default function AboutVAD() {
             __pycache__/<br />
             *.pyc<br />
             .env<br />
-            .env.local" > .gitignore<br />
+            .env.local"  .gitignore<br />
             <br />
             # Initialize repo (if not cloned)<br />
             git init<br />

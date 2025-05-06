@@ -5,7 +5,7 @@ import { motion, useScroll, useTransform } from "framer-motion";
 import Image from "next/image";
 import { useRouter } from "next/navigation";
 import { ArrowRight, Brain, ChevronDown, Clock, Eye, LineChart, Shield, Wand2 } from "lucide-react";
-import Link from "next/link";
+
 import { useRef } from "react";
 
 export default function Home() {
