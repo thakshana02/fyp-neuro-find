@@ -1,0 +1,27 @@
+# Don't ignore gitattributes
+!.gitattributes
+
+# Ignore everything
+*
+
+# Allow frontend folder and its contents
+!/frontend/
+!/frontend/**
+/frontend/node_modules/
+
+# Only allow specific files in script folder
+!/script/
+/script/*
+!/script/app.py
+!/script/subclass.py
+# DO NOT include the .h5 files
+
+# Allow README and other important root files
+!README.md
+!requirements.txt
+!.gitignore
+
+# Ignore common unwanted files
+.DS_Store
+*.log
+__pycache__/
