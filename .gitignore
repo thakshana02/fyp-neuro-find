@@ -4,6 +4,12 @@
 # Ignore everything
 *
 
+# Don't ignore deployment files
+!/Aptfile
+
+!runtime.txt
+!Procfile
+
 # Allow frontend folder and its contents
 !/frontend/
 !/frontend/**
