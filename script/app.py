@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import tensorflow as tf
 import numpy as np
@@ -11,34 +11,69 @@ import io
 import base64
 from tensorflow.keras.preprocessing import image
 from pydicom import dcmread
-from waitress import serve
-from inference_sdk import InferenceHTTPClient
+import requests
+import tempfile
+import logging
+
+# Initialize logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Initialize Flask App
 app = Flask(__name__)
 CORS(app)
 
+# Get port from environment variable (for Heroku compatibility)
+port = int(os.environ.get("PORT", 5000))
+
 # Constants
 IMG_SIZE = 256
-BINARY_MODEL_PATH = os.path.join(os.getcwd(), "binary_epoch50.h5")
+MODEL_HF_URL = "https://huggingface.co/thakshana02/fyp_vad/resolve/main/binary_epoch50.h5"
+MODEL_FILENAME = "binary_epoch50.h5"
 
-# Initialize Roboflow Client for MRI validation
-ROBOFLOW_CLIENT = InferenceHTTPClient(
-    api_url="https://detect.roboflow.com",
-    api_key="Uv31TiRmfGZBE4y9mLLE"
-)
+# Function to download model from Hugging Face
+def download_model_from_hf(url, local_path):
+    """Download the model from Hugging Face to a local temporary path"""
+    try:
+        logger.info(f"Downloading model from {url}...")
+        response = requests.get(url, stream=True)
+        response.raise_for_status()  # Raise an error for bad responses
+        
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        
+        # Save the file
+        with open(local_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        
+        logger.info(f"Model successfully downloaded to {local_path}")
+        return local_path
+    except Exception as e:
+        logger.error(f"Error downloading model: {e}")
+        return None
 
-# Load
+# Load model
 def load_model():
     try:
-        return tf.keras.models.load_model(BINARY_MODEL_PATH, compile=False)
+        # Create a temporary directory to store the model
+        temp_dir = tempfile.gettempdir()
+        local_model_path = os.path.join(temp_dir, MODEL_FILENAME)
+        
+        # Check if model already exists in temp directory
+        if not os.path.exists(local_model_path):
+            # Download model from Hugging Face
+            download_model_from_hf(MODEL_HF_URL, local_model_path)
+        
+        # Load the model
+        return tf.keras.models.load_model(local_model_path, compile=False)
     except Exception as e:
-        print(f"Error loading model: {e}")
+        logger.error(f"Error loading model: {e}")
         return create_custom_model()
 
 def create_custom_model():
     """Fallback model creation if loading fails"""
-    print("Creating a custom model as fallback...")
+    logger.warning("Creating a custom model as fallback...")
     inputs = tf.keras.layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
     
     # Convolutional layers
@@ -56,16 +91,29 @@ def create_custom_model():
     model = tf.keras.Model(inputs=inputs, outputs=outputs)
     
     try:
-        model.load_weights(BINARY_MODEL_PATH)
-        print("Successfully loaded weights into the custom model.")
+        # Try to download and load weights from Hugging Face
+        temp_dir = tempfile.gettempdir()
+        local_model_path = os.path.join(temp_dir, MODEL_FILENAME)
+        
+        if not os.path.exists(local_model_path):
+            download_model_from_hf(MODEL_HF_URL, local_model_path)
+            
+        model.load_weights(local_model_path)
+        logger.info("Successfully loaded weights into the custom model.")
     except Exception as weight_error:
-        print(f"Error loading weights: {weight_error}")
-        print("WARNING: The model will not produce meaningful predictions!")
+        logger.error(f"Error loading weights: {weight_error}")
+        logger.warning("WARNING: The model will not produce meaningful predictions!")
     
     return model
 
 # Load the model
-binary_model = load_model()
+try:
+    logger.info("Loading binary model...")
+    binary_model = load_model()
+    logger.info(f"Model input shape: {binary_model.input_shape}")
+except Exception as e:
+    logger.error(f"Error during model initialization: {e}")
+    binary_model = None
 
 # Image processing functions
 def preprocess_image(img_path):
@@ -77,7 +125,7 @@ def preprocess_image(img_path):
         img_array = np.expand_dims(img_array, axis=0)
         return img_array, original_img
     except Exception as e:
-        print(f"Error preprocessing image: {e}")
+        logger.error(f"Error preprocessing image: {e}")
         return None, None
 
 def preprocess_dicom(dicom_path):
@@ -97,19 +145,38 @@ def preprocess_dicom(dicom_path):
         img_reshaped = np.expand_dims(img_normalized, axis=0)
         return img_reshaped, original_img
     except Exception as e:
-        print(f"Error processing DICOM file: {e}")
+        logger.error(f"Error processing DICOM file: {e}")
         return None, None
 
 def validate_mri(file_path):
-    """Validate if the uploaded file is an MRI image"""
+    """Basic validation if the uploaded file is an MRI image using simple heuristics"""
     try:
-        result = ROBOFLOW_CLIENT.infer(file_path, model_id="noisy-data/2")
-        if "predictions" in result and len(result["predictions"]) > 0:
+        # Read the image
+        img = cv2.imread(file_path)
+        if img is None:
+            return False, "Could not read image file"
+        
+        # Convert to grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Check if the image has the right characteristics of an MRI
+        # 1. Check for proper distribution of pixel intensities
+        hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
+        nonzero_ratio = np.count_nonzero(hist) / 256
+        
+        # 2. Check for brain-like features - look for regions
+        _, binary = cv2.threshold(gray, 20, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Primitive check: MRIs typically have good central regions
+        # If we find at least one sizeable contour and reasonable pixel distribution
+        if len(contours) > 0 and nonzero_ratio > 0.15:
             return True, "Valid MRI image"
         else:
             return False, "The uploaded image does not appear to be an MRI scan"
+            
     except Exception as e:
-        print(f"Error during MRI validation: {e}")
+        logger.error(f"Error during MRI validation: {e}")
         return False, f"Error validating image: {str(e)}"
 
 # Grad-CAM visualization
@@ -150,7 +217,7 @@ def create_visualization(heatmap, original_img):
         # Create blended image
         superimposed_img = cv2.addWeighted(original_rgb, 0.7, masked_heatmap_rgb, 0.5, 0)
         
-        # Create figure with subplots - use plt.figure with a clear backend specification
+        # Create figure with subplots
         plt.figure(figsize=(10, 5), dpi=100)
         plt.subplot(1, 2, 1)
         plt.imshow(original_rgb)
@@ -169,7 +236,7 @@ def create_visualization(heatmap, original_img):
         
         return img_str
     except Exception as e:
-        print(f"Error creating visualization: {e}")
+        logger.error(f"Error creating visualization: {e}")
         return None
 
 def generate_gradcam(model, preprocessed_img, original_img, layer_name=None):
@@ -191,7 +258,7 @@ def generate_gradcam(model, preprocessed_img, original_img, layer_name=None):
         
         # create fallback visualization
         if layer_name is None:
-            print("Creating a fallback heatmap")
+            logger.warning("Creating a fallback heatmap - no valid layer found")
             heatmap = np.random.rand(16, 16)
             heatmap = np.uint8(255 * heatmap)
             heatmap = cv2.resize(heatmap, (IMG_SIZE, IMG_SIZE))
@@ -206,7 +273,7 @@ def generate_gradcam(model, preprocessed_img, original_img, layer_name=None):
                 outputs=[grad_layer.output, model.output]
             )
         except Exception as layer_error:
-            print(f"Error creating Grad-CAM model: {layer_error}")
+            logger.error(f"Error creating Grad-CAM model: {layer_error}")
             # Fallback to saliency map
             if len(original_img.shape) == 3 and original_img.shape[2] == 3:
                 gray_img = cv2.cvtColor(original_img.astype(np.float32), cv2.COLOR_RGB2GRAY)
@@ -232,7 +299,7 @@ def generate_gradcam(model, preprocessed_img, original_img, layer_name=None):
             grads = tape.gradient(loss, conv_outputs)
             if grads is None:
                 # Fallback for gradient issues
-                print("Gradients are None, using random heatmap")
+                logger.warning("Gradients are None, using random heatmap")
                 output_shape = conv_outputs.shape.as_list()
                 heatmap = np.random.rand(output_shape[1], output_shape[2])
                 heatmap = np.uint8(255 * heatmap)
@@ -240,7 +307,7 @@ def generate_gradcam(model, preprocessed_img, original_img, layer_name=None):
                 heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
                 return create_visualization(heatmap, original_img)
         except Exception as grad_error:
-            print(f"Error computing gradients: {grad_error}")
+            logger.error(f"Error computing gradients: {grad_error}")
             # Random heatmap fallback
             heatmap = np.random.rand(16, 16)
             heatmap = np.uint8(255 * heatmap)
@@ -270,7 +337,7 @@ def generate_gradcam(model, preprocessed_img, original_img, layer_name=None):
         
         return create_visualization(heatmap, original_img)
     except Exception as e:
-        print(f"Error in generate_gradcam: {e}")
+        logger.error(f"Error in generate_gradcam: {e}")
         
         # Final fallback
         try:
@@ -297,7 +364,7 @@ def process_upload_file():
 
     # Save uploaded file 
     file_ext = os.path.splitext(file.filename)[-1].lower()
-    file_path = os.path.join(os.getcwd(), "temp_" + file.filename)
+    file_path = os.path.join(tempfile.gettempdir(), "temp_" + file.filename)
     file.save(file_path)
     
     if file_ext not in [".jpg", ".jpeg", ".png", ".dcm"]:
@@ -357,7 +424,7 @@ def predict():
         return jsonify(response)
     
     except Exception as e:
-        print(f"Error during prediction: {str(e)}")
+        logger.error(f"Error during prediction: {str(e)}")
         import traceback
         traceback.print_exc()  # Print full stack trace for debugging
         return jsonify({"error": f"Prediction failed: {str(e)}"}), 500
@@ -367,7 +434,7 @@ def predict():
             try:
                 os.remove(file_path)
             except Exception as cleanup_error:
-                print(f"Error cleaning up file: {cleanup_error}")
+                logger.error(f"Error cleaning up file: {cleanup_error}")
         
         # Make sure all matplotlib figures are closed
         plt.close('all')
@@ -395,7 +462,7 @@ def get_gradcam():
         return jsonify({"gradcam_visualization": gradcam_base64})
     
     except Exception as e:
-        print(f"Error generating Grad-CAM: {str(e)}")
+        logger.error(f"Error generating Grad-CAM: {str(e)}")
         import traceback
         traceback.print_exc()
         return jsonify({"error": f"Grad-CAM generation failed: {str(e)}"}), 500
@@ -405,7 +472,7 @@ def get_gradcam():
             try:
                 os.remove(file_path)
             except Exception as cleanup_error:
-                print(f"Error cleaning up file: {cleanup_error}")
+                logger.error(f"Error cleaning up file: {cleanup_error}")
         
         # Make sure all matplotlib figures are closed
         plt.close('all')
@@ -415,13 +482,42 @@ def health_check():
     """Health check endpoint"""
     return jsonify({
         "status": "healthy", 
-        "model": "Binary Model (epoch50)", 
+        "model": "Binary Model (epoch50) from Hugging Face", 
+        "model_url": MODEL_HF_URL,
         "xai": "Grad-CAM available"
     })
 
-# Run Flask App
+# Import subclass API functionality if available
+try:
+    # Try to import the subclass functionality from subclass.py
+    from subclass import setup_subclass_routes
+    
+    # Initialize subclass routes with the current Flask app
+    setup_subclass_routes(app)
+    logger.info("Subclass API routes successfully loaded")
+except ImportError:
+    logger.warning("Subclass module not found - subclass predictions will not be available")
+except Exception as e:
+    logger.error(f"Error setting up subclass routes: {e}")
+
+# Root route for verification
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({
+        "status": "running",
+        "service": "VAD Brain MRI Analysis API",
+        "endpoints": [
+            {"path": "/", "method": "GET", "description": "API info"},
+            {"path": "/health", "method": "GET", "description": "Service health check"},
+            {"path": "/predict", "method": "POST", "description": "Binary dementia prediction"},
+            {"path": "/gradcam", "method": "POST", "description": "Get visualization only"},
+            {"path": "/subclass_predict", "method": "POST", "description": "Subclass dementia type prediction"}
+        ]
+    })
+
+# Run Flask App - this will be used by gunicorn in production
 if __name__ == "__main__":
-    print(f"Model loaded from: {BINARY_MODEL_PATH}")
-    print(f"Expected input shape: {binary_model.input_shape}")
-    print("Flask API is running on http://127.0.0.1:5000")
-    serve(app, host="127.0.0.1", port=5000)
+    logger.info(f"Model loaded from Hugging Face: {MODEL_HF_URL}")
+    logger.info(f"Expected input shape: {binary_model.input_shape}")
+    logger.info(f"Starting Flask API on port {port}")
+    app.run(host="0.0.0.0", port=port)

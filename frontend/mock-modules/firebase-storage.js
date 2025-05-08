@@ -3,4 +3,4 @@ const getStorage = () => ({});
 
 module.exports = {
   getStorage,
-};
+};  
