@@ -1,80 +1,44 @@
-from flask import request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
 import tensorflow as tf
 import numpy as np
 import os
 import cv2
 from tensorflow.keras.preprocessing import image
 from pydicom import dcmread
+from waitress import serve
 from tensorflow.keras.models import Model
-import requests
-import tempfile
-import logging
 
-# Initialize logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Initialize Flask App
+app = Flask(__name__)
+CORS(app)
 
-# Constants
+SUBCLASS_MODEL_PATH = os.path.join(os.getcwd(), "VGG16_4_real_subclass.h5")
+subclass_model = tf.keras.models.load_model(SUBCLASS_MODEL_PATH)
+
+print("Model layers:")
+for i, layer in enumerate(subclass_model.layers):
+    print(f"Layer {i}: {layer.name} ({type(layer).__name__})")
+
 IMG_SIZE = 128
-MODEL_HF_URL = "https://huggingface.co/thakshana02/fyp_vad/resolve/main/VGG16_4_real_subclass.h5"
-MODEL_FILENAME = "VGG16_4_real_subclass.h5"
-HEATMAP_PATH = os.path.join(tempfile.gettempdir(), "gradcam_heatmap.jpg")
-COMBINED_HEATMAP_PATH = os.path.join(tempfile.gettempdir(), "combined_heatmap.jpg")
-
-# Function to download model from Hugging Face
-def download_model_from_hf(url, local_path):
-    try:
-        logger.info(f"Downloading model from {url}...")
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-        
-        os.makedirs(os.path.dirname(local_path), exist_ok=True)
-        
-        with open(local_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        
-        logger.info(f"Model successfully downloaded to {local_path}")
-        return local_path
-    except Exception as e:
-        logger.error(f"Error downloading model: {e}")
-        return None
-
-# Load subclass model
-def load_subclass_model():
-    try:
-        # Create temp directory and download model
-        temp_dir = tempfile.gettempdir()
-        local_model_path = os.path.join(temp_dir, MODEL_FILENAME)
-
-        # Check if model already exists in temp directory
-        if not os.path.exists(local_model_path):
-            download_model_from_hf(MODEL_HF_URL, local_model_path)
-
-        model = tf.keras.models.load_model(local_model_path)
-        logger.info("Subclass model loaded successfully")
-        return model
-    except Exception as e:
-        logger.error(f"Error loading subclass model: {e}")
-        return None
+HEATMAP_PATH = os.path.join(os.getcwd(), "gradcam_heatmap.jpg")
+COMBINED_HEATMAP_PATH = os.path.join(os.getcwd(), "combined_heatmap.jpg")
 
 # Image preprocessing function
 def preprocess_image(img_path):
-    try:
-        img = image.load_img(img_path, target_size=(IMG_SIZE, IMG_SIZE))
-        img_array = image.img_to_array(img) / 255.0
-        
-        # Create a brain mask for later use
-        gray_img = cv2.cvtColor(np.uint8(img_array*255), cv2.COLOR_RGB2GRAY)
-        _, brain_mask = cv2.threshold(gray_img, 15, 255, cv2.THRESH_BINARY)
-        kernel = np.ones((5,5), np.uint8)
-        brain_mask = cv2.morphologyEx(brain_mask, cv2.MORPH_CLOSE, kernel)
-        
-        img_array = np.expand_dims(img_array, axis=0)
-        return img_array, brain_mask
-    except Exception as e:
-        logger.error(f"Error preprocessing image: {e}")
-        return None, None
+    img = image.load_img(img_path, target_size=(IMG_SIZE, IMG_SIZE))
+    img_array = image.img_to_array(img) / 255.0
+    
+    # Create a brain mask for later use
+    gray_img = cv2.cvtColor(np.uint8(img_array*255), cv2.COLOR_RGB2GRAY)
+    _, brain_mask = cv2.threshold(gray_img, 15, 255, cv2.THRESH_BINARY)
+    kernel = np.ones((5,5), np.uint8)
+    brain_mask = cv2.morphologyEx(brain_mask, cv2.MORPH_CLOSE, kernel)
+    
+    cv2.imwrite("brain_mask.jpg", brain_mask)
+    
+    img_array = np.expand_dims(img_array, axis=0)
+    return img_array, brain_mask
 
 # Process DICOM files
 def preprocess_dicom(dicom_path):
@@ -94,6 +58,9 @@ def preprocess_dicom(dicom_path):
         kernel = np.ones((5,5), np.uint8)
         brain_mask = cv2.morphologyEx(brain_mask, cv2.MORPH_CLOSE, kernel)
         
+        # Save mask for debugging
+        cv2.imwrite("brain_mask.jpg", brain_mask)
+        
         # Convert to RGB by repeating the channel
         if len(img_resized.shape) == 2:
             img_rgb = np.stack((img_resized,) * 3, axis=-1)
@@ -103,7 +70,7 @@ def preprocess_dicom(dicom_path):
         img_reshaped = np.expand_dims(img_rgb, axis=0)
         return img_reshaped, brain_mask
     except Exception as e:
-        logger.error(f"Error processing DICOM: {e}")
+        print(f"Error processing DICOM: {e}")
         return None, None
 
 # Find the target layer for GradCAM
@@ -112,12 +79,14 @@ def find_target_layer(model):
         # Get the VGG16 layer
         vgg16_layer = model.get_layer('vgg16')
         
+        # Extract the base model
         if hasattr(vgg16_layer, 'layers'):
             # Look for the last conv layer in the VGG16 model
             for nested_layer in reversed(vgg16_layer.layers):
                 if isinstance(nested_layer, tf.keras.layers.Conv2D):
                     return 'vgg16'  
         
+
     for layer in reversed(model.layers):
         if isinstance(layer, tf.keras.layers.Conv2D):
             return layer.name
@@ -127,14 +96,14 @@ def find_target_layer(model):
     
     return model.layers[-1].name
 
-# GradCAM implementation
+# Improved GradCAM implementation
 def generate_accurate_gradcam(img_array, model, class_index, brain_mask=None):
     try:
         # Get the last convolutional layer
         target_layer_name = find_target_layer(model)
         
         if not target_layer_name:
-            logger.warning("Could not find appropriate target layer for GradCAM")
+            print("Could not find appropriate target layer for GradCAM")
             return None
         
         if target_layer_name == 'vgg16':
@@ -146,14 +115,14 @@ def generate_accurate_gradcam(img_array, model, class_index, brain_mask=None):
                     outputs=[vgg_layer.output, model.output]
                 )
             else:
-                logger.warning("VGG16 layer not working correctly, using fallback")
+                print("VGG16 layer doesn't have expected structure, using fallback")
                 return generate_fallback_gradcam(img_array, brain_mask)
         else:
             grad_model = Model(
                 inputs=model.inputs,
                 outputs=[
-                    model.get_layer(target_layer_name).output, # Model Layer (Feature Map of the Target Layer) 
-                    model.output # Model Output (Prediction) 
+                    model.get_layer(target_layer_name).output,
+                    model.output
                 ]
             )
         
@@ -209,7 +178,7 @@ def generate_accurate_gradcam(img_array, model, class_index, brain_mask=None):
         return COMBINED_HEATMAP_PATH
     
     except Exception as e:
-        logger.error(f"Error generating GradCAM: {e}")
+        print(f"Error generating GradCAM: {e}")
         import traceback
         traceback.print_exc()
         # Use fallback method
@@ -241,7 +210,7 @@ def generate_fallback_gradcam(img_array, brain_mask=None):
         else:
             center_y, center_x = IMG_SIZE // 2, IMG_SIZE // 2
         
-        # distance Calculation
+        # distance Calaculation
         ventricle_dist = np.sqrt((y - center_y)**2 + (x - center_x)**2)
         ventricle_weight = np.exp(-ventricle_dist**2 / (2*(IMG_SIZE/6)**2))
         
@@ -275,7 +244,7 @@ def generate_fallback_gradcam(img_array, brain_mask=None):
         return COMBINED_HEATMAP_PATH
     
     except Exception as e:
-        logger.error(f"Error in fallback GradCAM: {e}")
+        print(f"Error in fallback GradCAM: {e}")
         import traceback
         traceback.print_exc()
         
@@ -287,122 +256,113 @@ def generate_fallback_gradcam(img_array, brain_mask=None):
         cv2.imwrite(COMBINED_HEATMAP_PATH, blank)
         return COMBINED_HEATMAP_PATH
 
-# Load the model at module initialization
-subclass_model = None
-
-def setup_subclass_routes(app):
-    """Setup all routes for the subclass prediction functionality"""
-    global subclass_model
+# Subclass prediction endpoint
+@app.route("/subclass_predict", methods=["POST"])
+def subclass_predict():
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
     
-    # Load the model if not already loaded
-    if subclass_model is None:
-        subclass_model = load_subclass_model()
-        
-    if subclass_model is None:
-        logger.error("Failed to load subclass model - routes will not function properly")
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"error": "No selected file"}), 400
     
-    # Subclass prediction endpoint
-    @app.route("/subclass_predict", methods=["POST"])
-    def subclass_predict():
-        if "file" not in request.files:
-            return jsonify({"error": "No file uploaded"}), 400
+    # Save uploaded file
+    file_path = os.path.join(os.getcwd(), file.filename)
+    file.save(file_path)
+    
+    try:
+        # Process file based on extension
+        file_ext = os.path.splitext(file.filename)[-1].lower()
         
-        file = request.files["file"]
-        if file.filename == "":
-            return jsonify({"error": "No selected file"}), 400
+        if file_ext in ['.jpg', '.jpeg', '.png']:
+            preprocessed_img, brain_mask = preprocess_image(file_path)
+        elif file_ext == '.dcm':
+            preprocessed_img, brain_mask = preprocess_dicom(file_path)
+        else:
+            preprocessed_img, brain_mask = preprocess_image(file_path)  
         
-        # Save uploaded file
-        file_path = os.path.join(tempfile.gettempdir(), file.filename)
-        file.save(file_path)
+        if preprocessed_img is None:
+            raise Exception("Failed to preprocess image")
         
+        prediction = subclass_model.predict(preprocessed_img)
+        
+        # Define classes
+        classes = [
+            "Hemorrhagic Dementia",
+            "Binswanger Dementia",
+            "Strategic Dementia",
+            "Subcortical Dementia"
+        ]
+        
+        # Get results
+        class_index = np.argmax(prediction)
+        predicted_class = classes[class_index]
+        confidence = round(float(np.max(prediction)) * 100, 2)
+        
+        class_probs = {label: round(float(prob) * 100, 2) 
+                      for label, prob in zip(classes, prediction[0])}
+        
+        # Generate GradCAM visualization
         try:
-            # Process file based on extension
-            file_ext = os.path.splitext(file.filename)[-1].lower()
-            
-            if file_ext in ['.jpg', '.jpeg', '.png']:
-                preprocessed_img, brain_mask = preprocess_image(file_path)
-            elif file_ext == '.dcm':
-                preprocessed_img, brain_mask = preprocess_dicom(file_path)
-            else:
-                preprocessed_img, brain_mask = preprocess_image(file_path)  
-            
-            if preprocessed_img is None:
-                raise Exception("Failed to preprocess image")
-            
-            prediction = subclass_model.predict(preprocessed_img)
-            
-            # Define classes
-            classes = [
-                "Hemorrhagic Dementia",
-                "Binswanger Dementia",
-                "Strategic Dementia",
-                "Subcortical Dementia"
-            ]
-            
-            # Get results
-            class_index = np.argmax(prediction)
-            predicted_class = classes[class_index]
-            confidence = round(float(np.max(prediction)) * 100, 2)
-            
-            class_probs = {label: round(float(prob) * 100, 2) 
-                          for label, prob in zip(classes, prediction[0])}
-            
-            # Generate GradCAM visualization
-            try:
-                heatmap_path = generate_accurate_gradcam(
-                    preprocessed_img,
-                    subclass_model,
-                    class_index,
-                    brain_mask
-                )
-            except Exception as e:
-                logger.error(f"Error in primary GradCAM method: {e}. Using fallback method.")
-                # If that fails, use the fallback method
-                heatmap_path = generate_fallback_gradcam(preprocessed_img, brain_mask)
-            
-            # Return results with guaranteed heatmap URL
-            return jsonify({
-                "prediction": predicted_class,
-                "confidence": confidence,
-                "class_probabilities": class_probs,
-                "heatmap_url": "/gradcam_heatmap"
-            })
-        
+            heatmap_path = generate_accurate_gradcam(
+                preprocessed_img,
+                subclass_model,
+                class_index,
+                brain_mask
+            )
         except Exception as e:
-            logger.error(f"Error in prediction: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            blank = np.ones((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8) * 255
-            cv2.putText(blank, "Error processing", (10, IMG_SIZE//2 - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-            cv2.putText(blank, "image", (10, IMG_SIZE//2 + 20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-            cv2.imwrite(COMBINED_HEATMAP_PATH, blank)
-            
-            return jsonify({
-                "error": str(e),
-                "heatmap_url": "/gradcam_heatmap"
-            }), 500
+            print(f"Error in primary GradCAM method: {e}. Using fallback method.")
+            # If that fails, use the fallback method
+            heatmap_path = generate_fallback_gradcam(preprocessed_img, brain_mask)
         
-        finally:
-            if os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                except:
-                    pass
-
-    # Heatmap endpoint
-    @app.route("/gradcam_heatmap", methods=["GET"])
-    def get_gradcam():
-        if os.path.exists(COMBINED_HEATMAP_PATH):
-            return send_file(COMBINED_HEATMAP_PATH, mimetype="image/jpeg")
-        elif os.path.exists(HEATMAP_PATH):
-            return send_file(HEATMAP_PATH, mimetype="image/jpeg")
+        # Return results with guaranteed heatmap URL
+        return jsonify({
+            "prediction": predicted_class,
+            "confidence": confidence,
+            "class_probabilities": class_probs,
+            "heatmap_url": "/gradcam_heatmap"
+        })
+    
+    except Exception as e:
+        print(f"Error in prediction: {e}")
+        import traceback
+        traceback.print_exc()
         
-        # If no heatmap exists, create a blank one
         blank = np.ones((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8) * 255
-        cv2.putText(blank, "Heatmap unavailable", (10, IMG_SIZE//2),
+        cv2.putText(blank, "Error processing", (10, IMG_SIZE//2 - 10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+        cv2.putText(blank, "image", (10, IMG_SIZE//2 + 20),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
         cv2.imwrite(COMBINED_HEATMAP_PATH, blank)
+        
+        return jsonify({
+            "error": str(e),
+            "heatmap_url": "/gradcam_heatmap"
+        }), 500
+    
+    finally:
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except:
+                pass
+
+# Heatmap endpoint
+@app.route("/gradcam_heatmap", methods=["GET"])
+def get_gradcam():
+    if os.path.exists(COMBINED_HEATMAP_PATH):
         return send_file(COMBINED_HEATMAP_PATH, mimetype="image/jpeg")
+    elif os.path.exists(HEATMAP_PATH):
+        return send_file(HEATMAP_PATH, mimetype="image/jpeg")
+    
+    # If no heatmap exists, create a blank one
+    blank = np.ones((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8) * 255
+    cv2.putText(blank, "Heatmap unavailable", (10, IMG_SIZE//2),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+    cv2.imwrite(COMBINED_HEATMAP_PATH, blank)
+    return send_file(COMBINED_HEATMAP_PATH, mimetype="image/jpeg")
+
+# Run server
+if __name__ == "__main__":
+    print("API running on http://127.0.0.1:5001")
+    serve(app, host="127.0.0.1", port=5001)
